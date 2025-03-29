@@ -10,6 +10,7 @@ from typing import Dict, Any
 from app.config import settings
 from app.tasks.retry_config import BaseTaskWithRetry
 from app.celery_app import celery
+from app.utils import task_logger, log_task
 
 logger = logging.getLogger(__name__)
 
@@ -46,13 +47,15 @@ def poll_task_for_document_id(task_id: str) -> int:
 
     while attempts < POLL_MAX_ATTEMPTS:
         try:
+            task_logger(f"Polling Paperless for task {task_id}, attempt {attempts+1}/{POLL_MAX_ATTEMPTS}", 
+                      step_name="paperless_poll")
             resp = requests.get(url, headers=_get_headers(), params={"task_id": task_id})
             resp.raise_for_status()
             tasks_data = resp.json()
         except requests.exceptions.RequestException as exc:
-            logger.warning(
-                "Failed to poll for task_id='%s'. Attempt=%d Error=%s",
-                task_id, attempts + 1, exc
+            task_logger(
+                f"Failed to poll for task_id='{task_id}'. Attempt={attempts + 1}/{POLL_MAX_ATTEMPTS} Error={exc}",
+                level="warning", step_name="paperless_poll"
             )
             time.sleep(POLL_INTERVAL_SEC)
             attempts += 1
@@ -67,21 +70,29 @@ def poll_task_for_document_id(task_id: str) -> int:
             if status == "SUCCESS":
                 doc_str = task_info.get("related_document")
                 if doc_str:
+                    task_logger(f"Task {task_id} completed successfully with document ID: {doc_str}", 
+                              step_name="paperless_poll", status="success")
                     return int(doc_str)
                 raise RuntimeError(
                     f"Task {task_id} completed but no doc ID found. Task info: {task_info}"
                 )
             elif status == "FAILURE":
-                raise RuntimeError(f"Task {task_id} failed: {task_info.get('result')}")
+                error_msg = f"Task {task_id} failed: {task_info.get('result')}"
+                task_logger(error_msg, level="error", step_name="paperless_poll", status="failure")
+                raise RuntimeError(error_msg)
+            else:
+                task_logger(f"Task {task_id} status: {status}, waiting {POLL_INTERVAL_SEC}s", 
+                          step_name="paperless_poll")
 
         attempts += 1
         time.sleep(POLL_INTERVAL_SEC)
 
-    raise TimeoutError(
-        f"Task {task_id} didn't reach SUCCESS within {POLL_MAX_ATTEMPTS} attempts."
-    )
+    timeout_msg = f"Task {task_id} didn't reach SUCCESS within {POLL_MAX_ATTEMPTS} attempts."
+    task_logger(timeout_msg, level="error", step_name="paperless_poll", status="failure")
+    raise TimeoutError(timeout_msg)
 
 @celery.task(base=BaseTaskWithRetry)
+@log_task("upload_to_paperless")
 def upload_to_paperless(file_path: str) -> Dict[str, Any]:
     """
     Uploads a PDF to Paperless with minimal metadata (filename and date only).
@@ -93,9 +104,11 @@ def upload_to_paperless(file_path: str) -> Dict[str, Any]:
     Returns a dict with status, the paperless_task_id, paperless_document_id, and file_path.
     """
     if not os.path.exists(file_path):
+        task_logger(f"File not found: {file_path}", level="error", step_name="paperless_upload")
         raise FileNotFoundError(f"File not found: {file_path}")
 
     base_name = os.path.basename(file_path)
+    task_logger(f"Starting upload of {base_name} to Paperless", step_name="paperless_upload")
 
     # Upload the PDF
     post_url = _paperless_api_url("/api/documents/post_document/")
@@ -106,22 +119,21 @@ def upload_to_paperless(file_path: str) -> Dict[str, Any]:
         data = {"title": base_name}  # Title = Filename (no additional metadata)
 
         try:
-            logger.debug("Posting document to Paperless: file=%s", base_name)
+            task_logger(f"Posting document to Paperless: file={base_name}", step_name="paperless_upload")
             resp = requests.post(post_url, headers=_get_headers(), files=files, data=data)
             resp.raise_for_status()
         except requests.exceptions.RequestException as exc:
-            logger.error(
-                "Failed to upload document '%s' to Paperless. Error: %s. Response=%s",
-                file_path, exc, getattr(exc.response, "text", "<no response>")
-            )
+            error_msg = f"Failed to upload document '{file_path}' to Paperless. Error: {exc}. Response={getattr(exc.response, 'text', '<no response>')}"
+            task_logger(error_msg, level="error", step_name="paperless_upload", status="failure")
             raise
 
         raw_task_id = resp.text.strip().strip('"').strip("'")
-        logger.info(f"Received Paperless task ID: {raw_task_id}")
+        task_logger(f"Received Paperless task ID: {raw_task_id}", step_name="paperless_upload")
 
     # Poll tasks until success/fail => get doc_id
     doc_id = poll_task_for_document_id(raw_task_id)
-    logger.info(f"Document {file_path} successfully ingested => ID={doc_id}")
+    task_logger(f"Document {file_path} successfully ingested => ID={doc_id}", 
+              step_name="paperless_upload", status="success")
 
     return {
         "status": "Completed",

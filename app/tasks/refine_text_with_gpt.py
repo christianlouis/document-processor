@@ -3,6 +3,7 @@
 from app.config import settings
 import openai
 from app.tasks.retry_config import BaseTaskWithRetry
+from app.utils import task_logger, log_task
 
 # Import the shared Celery instance
 from app.celery_app import celery
@@ -14,8 +15,12 @@ client = openai.OpenAI(
 )
 
 @celery.task(base=BaseTaskWithRetry)
+@log_task("refine_text")
 def refine_text_with_gpt(s3_filename: str, raw_text: str):
     """Uses OpenAI to clean and refine OCR text."""
+    task_id = refine_text_with_gpt.request.id
+    task_logger(f"Starting text refinement for {s3_filename}", step_name="refine_text", task_id=task_id)
+    
     response = client.chat.completions.create(
         model=settings.openai_model,
         messages=[
@@ -25,10 +30,12 @@ def refine_text_with_gpt(s3_filename: str, raw_text: str):
     )
     
     cleaned_text = response.choices[0].message.content
+    task_logger(f"Text refinement completed for {s3_filename}", step_name="refine_text", task_id=task_id)
 
     # Trigger next task (import locally if needed to avoid circular imports)
     from app.tasks.extract_metadata_with_gpt import extract_metadata_with_gpt
-    extract_metadata_with_gpt.delay(s3_filename, cleaned_text)
+    metadata_task = extract_metadata_with_gpt.delay(s3_filename, cleaned_text)
+    task_logger(f"Triggered metadata extraction task: {metadata_task.id}", step_name="refine_text", task_id=task_id)
 
-    return {"s3_file": s3_filename, "cleaned_text": cleaned_text}
+    return {"file": s3_filename, "cleaned_text": cleaned_text}
 

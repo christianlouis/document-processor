@@ -12,6 +12,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from pathlib import Path
 
 from app.database import init_db
+from app.db_migration import run_migrations
 from app.config import settings
 from app.tasks.process_document import process_document  # Updated import
 from app.tasks.upload_to_dropbox import upload_to_dropbox
@@ -52,6 +53,7 @@ app.mount("/static", StaticFiles(directory=frontend_static_dir), name="static")
 @app.on_event("startup")
 def on_startup():
     init_db()  # Create tables if they don't exist
+    run_migrations()  # Run migrations to add any missing columns
 
 @app.post("/process/")
 def process(file_path: str):

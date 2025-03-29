@@ -7,6 +7,7 @@ import json
 from app.config import settings
 from app.tasks.retry_config import BaseTaskWithRetry
 from app.tasks.finalize_document_storage import finalize_document_storage
+from app.utils import task_logger, log_task
 
 # Import the shared Celery instance
 from app.celery_app import celery
@@ -39,6 +40,7 @@ def persist_metadata(metadata, final_pdf_path):
     return json_path
 
 @celery.task(base=BaseTaskWithRetry)
+@log_task("embed_metadata")
 def embed_metadata_into_pdf(local_file_path: str, extracted_text: str, metadata: dict):
     """
     Embeds extracted metadata into the PDF's standard metadata fields.
@@ -59,8 +61,10 @@ def embed_metadata_into_pdf(local_file_path: str, extracted_text: str, metadata:
         alt_path = os.path.join(settings.workdir, "tmp", os.path.basename(local_file_path))
         if os.path.exists(alt_path):
             local_file_path = alt_path
+            task_logger(f"Using alternative path: {local_file_path}", step_name="embed_metadata")
         else:
-            print(f"[ERROR] Local file {local_file_path} not found, cannot embed metadata.")
+            task_logger(f"Local file {local_file_path} not found, cannot embed metadata.", 
+                      level="error", step_name="embed_metadata")
             return {"error": "File not found"}
 
     # Work on a safe copy in /tmp
@@ -70,9 +74,10 @@ def embed_metadata_into_pdf(local_file_path: str, extracted_text: str, metadata:
 
     # Create a safe copy to work on
     shutil.copy(original_file, processed_file)
+    task_logger(f"Created working copy at {processed_file}", step_name="embed_metadata")
 
     try:
-        print(f"[DEBUG] Embedding metadata into {processed_file}...")
+        task_logger(f"Embedding metadata into {processed_file}", step_name="embed_metadata")
 
         # Open the PDF
         doc = fitz.open(processed_file)
@@ -87,7 +92,7 @@ def embed_metadata_into_pdf(local_file_path: str, extracted_text: str, metadata:
         doc.save(processed_file, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
         doc.close()
 
-        print(f"[INFO] Metadata embedded successfully in {processed_file}")
+        task_logger("Metadata embedded successfully", step_name="embed_metadata")
 
         # Use the suggested filename from metadata; if not provided, use the original basename.
         suggested_filename = metadata.get("filename", os.path.splitext(os.path.basename(local_file_path))[0])
@@ -101,28 +106,34 @@ def embed_metadata_into_pdf(local_file_path: str, extracted_text: str, metadata:
 
         # Move the processed file using shutil.move to handle cross-device moves.
         shutil.move(processed_file, final_file_path)
+        task_logger(f"Moved processed file to {final_file_path}", step_name="embed_metadata")
+        
         # Ensure the temporary file is deleted if it still exists.
         if os.path.exists(processed_file):
             os.remove(processed_file)
 
         # Persist the metadata into a JSON file with the same base name.
         json_path = persist_metadata(metadata, final_file_path)
-        print(f"[INFO] Metadata persisted to {json_path}")
+        task_logger(f"Metadata persisted to {json_path}", step_name="embed_metadata")
 
         # Trigger the next step: final storage.
-        finalize_document_storage.delay(original_file, final_file_path, metadata)
+        finalize_doc_task = finalize_document_storage.delay(original_file, final_file_path, metadata)
+        task_logger(f"Triggered final document storage with task ID: {finalize_doc_task.id}", 
+                  step_name="embed_metadata")
 
         # After triggering final storage, delete the original file if it is in workdir/tmp.
         workdir_tmp = os.path.join(settings.workdir, "tmp")
         if original_file.startswith(workdir_tmp) and os.path.exists(original_file):
             try:
                 os.remove(original_file)
-                print(f"[INFO] Deleted original file from {original_file}")
+                task_logger(f"Deleted original file from {original_file}", step_name="embed_metadata")
             except Exception as e:
-                print(f"[ERROR] Could not delete original file {original_file}: {e}")
+                task_logger(f"Could not delete original file {original_file}: {e}", 
+                          level="warning", step_name="embed_metadata")
 
         return {"file": final_file_path, "metadata_file": json_path, "status": "Metadata embedded"}
 
     except Exception as e:
-        print(f"[ERROR] Failed to embed metadata into {processed_file}: {e}")
+        task_logger(f"Failed to embed metadata into {processed_file}: {e}", 
+                  level="error", step_name="embed_metadata")
         return {"error": str(e)}

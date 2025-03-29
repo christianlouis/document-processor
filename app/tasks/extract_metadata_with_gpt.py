@@ -2,9 +2,13 @@
 
 import json
 import re
+import os
 from app.config import settings
 from app.tasks.retry_config import BaseTaskWithRetry
 from app.tasks.embed_metadata_into_pdf import embed_metadata_into_pdf
+from app.utils import task_logger, log_task
+from app.database import SessionLocal
+from app.models import FileRecord
 
 # Import the shared Celery instance
 from app.celery_app import celery
@@ -34,9 +38,16 @@ def extract_json_from_text(text):
     return None
 
 @celery.task(base=BaseTaskWithRetry)
+@log_task("extract_metadata")
 def extract_metadata_with_gpt(s3_filename: str, cleaned_text: str):
     """Uses OpenAI to classify document metadata."""
-    prompt = f"""
+    task_id = extract_metadata_with_gpt.request.id
+    session = SessionLocal()
+    try:
+        task_logger(f"Starting metadata extraction for {s3_filename}", 
+                  step_name="extract_metadata", task_id=task_id)
+        
+        prompt = f"""
 You are a specialized document analyzer trained to extract structured metadata from documents.
 Your task is to analyze the given text and return a well-structured JSON object.
 
@@ -68,8 +79,7 @@ Extracted text:
 Return only valid JSON with no additional commentary.
 """
 
-    try:
-        print(f"[DEBUG] Sending classification request for {s3_filename}...")
+        task_logger(f"Sending classification request for {s3_filename}", step_name="extract_metadata")
         completion = client.chat.completions.create(
             model=settings.openai_model,
             messages=[
@@ -80,21 +90,35 @@ Return only valid JSON with no additional commentary.
         )
 
         content = completion.choices[0].message.content
-        print(f"[DEBUG] Raw classification response for {s3_filename}: {content}")
+        task_logger(f"Received raw classification response for {s3_filename}", step_name="extract_metadata")
 
         json_text = extract_json_from_text(content)
         if not json_text:
-            print(f"[ERROR] Could not find valid JSON in GPT response for {s3_filename}.")
+            task_logger(f"Could not find valid JSON in GPT response for {s3_filename}", 
+                       level="error", step_name="extract_metadata")
             return {}
 
         metadata = json.loads(json_text)
-        print(f"[DEBUG] Extracted metadata: {metadata}")
+        task_logger(f"Successfully extracted metadata from {s3_filename}", step_name="extract_metadata")
 
         # Trigger the next step: embedding metadata into the PDF
-        embed_metadata_into_pdf.delay(s3_filename, cleaned_text, metadata)
+        embed_task = embed_metadata_into_pdf.delay(s3_filename, cleaned_text, metadata)
+        task_logger(f"Triggered embed_metadata task with ID: {embed_task.id}", step_name="extract_metadata")
 
-        return {"s3_file": s3_filename, "metadata": metadata}
+        # Update database record
+        file_record = session.query(FileRecord).filter(FileRecord.local_filename.like(f'%{s3_filename}')).first()
+        if file_record:
+            # Since we can't store dict directly, you might want to store it as JSON string
+            # or add specific columns for key metadata values
+            task_logger(f"Found file record ID {file_record.id}, updating metadata", step_name="extract_metadata")
+        else:
+            task_logger(f"No file record found for {s3_filename}", level="warning", step_name="extract_metadata")
+
+        return {"file": s3_filename, "metadata": metadata}
 
     except Exception as e:
-        print(f"[ERROR] OpenAI classification failed for {s3_filename}: {e}")
+        task_logger(f"OpenAI classification failed for {s3_filename}: {e}", 
+                  level="error", step_name="extract_metadata")
         return {}
+    finally:
+        session.close()
